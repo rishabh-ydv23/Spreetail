@@ -8,7 +8,7 @@ from rest_framework.views import APIView
 
 from .models import Expense, Group, GroupMember, ImportBatch, ImportIssue, ImportRow, Settlement
 from .permissions import IsGroupMember
-from .services import BalanceService
+from .services import BalanceService, CSVImportService
 from .serializers import (
     ExpenseSerializer,
     GroupMemberSerializer,
@@ -126,9 +126,33 @@ class ImportBatchViewSet(viewsets.ModelViewSet):
         group_id = self.kwargs['group_pk']
         return self.queryset.filter(group_id=group_id)
 
-    def perform_create(self, serializer):
+    def create(self, request, *args, **kwargs):
         group_id = self.kwargs['group_pk']
-        serializer.save(imported_by=self.request.user, group_id=group_id)
+        group = Group.objects.get(id=group_id)
+        file = request.FILES.get('file')
+        if file is None:
+            return Response({'detail': 'CSV file is required.'}, status=400)
+
+        raw_content = file.read()
+        batch = CSVImportService.create_import_batch(
+            group=group,
+            imported_by=request.user,
+            source_file_name=file.name,
+            raw_content=raw_content,
+        )
+        serializer = self.get_serializer(batch)
+        return Response(serializer.data, status=201)
+
+    @action(detail=True, methods=['post'])
+    def commit(self, request, pk=None, **kwargs):
+        batch = self.get_object()
+        approve_all = request.data.get('approve_all', False)
+        try:
+            CSVImportService.commit_batch(batch, approve_all=approve_all)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=409)
+        serializer = self.get_serializer(batch)
+        return Response(serializer.data)
 
     @action(detail=True, methods=['get'])
     def issues(self, request, pk=None):

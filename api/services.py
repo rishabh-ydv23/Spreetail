@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
+import json
 from collections import defaultdict
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable
@@ -156,3 +160,208 @@ class ImportService:
             recommendation=recommendation,
             requires_approval=requires_approval,
         )
+
+
+class CSVImportService:
+    REQUIRED_COLUMNS = [
+        'payer',
+        'date',
+        'total_amount',
+        'currency',
+        'split_type',
+        'participants',
+    ]
+
+    @staticmethod
+    def checksum_content(content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def parse_csv_rows(content: bytes) -> list[dict]:
+        decoded = content.decode('utf-8-sig')
+        reader = csv.DictReader(io.StringIO(decoded))
+        rows = []
+        for row_number, row in enumerate(reader, start=1):
+            rows.append({'row_number': row_number, 'raw_data': {k: v.strip() for k, v in row.items()}})
+        return rows
+
+    @staticmethod
+    def normalize_participants(value: str) -> list[dict]:
+        if not value:
+            return []
+        try:
+            participants = json.loads(value)
+            if isinstance(participants, list):
+                return participants
+        except json.JSONDecodeError:
+            pass
+        segments = [segment.strip() for segment in value.split(';') if segment.strip()]
+        parsed = []
+        for segment in segments:
+            if ':' in segment:
+                identifier, fraction = segment.split(':', 1)
+                parsed.append({'identifier': identifier.strip(), 'value': fraction.strip()})
+        return parsed
+
+    @staticmethod
+    def resolve_user_id(group, identifier: str):
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        if '@' in identifier:
+            return User.objects.filter(email__iexact=identifier).values_list('id', flat=True).first()
+        return User.objects.filter(username__iexact=identifier).values_list('id', flat=True).first()
+
+    @classmethod
+    def parse_row_data(cls, row: dict, group):
+        errors = []
+        parsed = {}
+
+        payer_identifier = row.get('payer')
+        if not payer_identifier:
+            errors.append(('missing_payer', 'high', 'Missing payer', 'Provide a payer value.', True))
+        else:
+            payer_id = cls.resolve_user_id(group, payer_identifier)
+            if not payer_id:
+                errors.append(('unknown_member', 'high', 'Unknown payer', f'Could not resolve payer {payer_identifier}.', True))
+            parsed['payer_id'] = payer_id
+
+        if not row.get('description'):
+            row['description'] = 'Imported expense'
+        parsed['description'] = row['description']
+        parsed['category'] = row.get('category', '')
+
+        date_value = row.get('date')
+        try:
+            parsed['date'] = timezone.datetime.fromisoformat(date_value).date() if date_value else None
+        except (TypeError, ValueError):
+            errors.append(('invalid_date', 'high', 'Invalid date', f'Expense date is invalid: {date_value}', True))
+            parsed['date'] = None
+
+        try:
+            parsed['total_amount'] = Decimal(row.get('total_amount', '0'))
+            if parsed['total_amount'] <= 0:
+                errors.append(('negative_amount', 'high', 'Negative or zero amount', 'Expense total must be greater than zero.', True))
+        except ArithmeticError:
+            errors.append(('invalid_amount', 'high', 'Invalid amount', f'Unable to parse total amount: {row.get("total_amount")}', True))
+            parsed['total_amount'] = Decimal('0')
+
+        parsed['currency'] = row.get('currency', '')
+        if parsed['currency'] != group.currency:
+            errors.append(('currency_mismatch', 'medium', 'Currency mismatch', f'Expected {group.currency}, got {parsed["currency"]}.', True))
+
+        split_type = row.get('split_type', '').lower()
+        if split_type not in {'equal', 'exact', 'percentage'}:
+            errors.append(('invalid_split', 'high', 'Invalid split type', f'Unknown split type: {split_type}', True))
+        parsed['split_type'] = split_type
+
+        participants_raw = row.get('participants', '')
+        participants = cls.normalize_participants(participants_raw)
+        normalized = []
+        for participant in participants:
+            identifier = participant.get('user_email') or participant.get('username') or participant.get('user_id') or participant.get('identifier')
+            if not identifier:
+                continue
+            user_id = cls.resolve_user_id(group, identifier)
+            if not user_id:
+                errors.append(('unknown_member', 'medium', 'Unknown participant', f'Could not resolve participant {identifier}.', True))
+                continue
+            amount = participant.get('amount')
+            percentage = participant.get('percentage')
+            if amount is not None:
+                try:
+                    amount = Decimal(str(amount))
+                except ArithmeticError:
+                    amount = None
+            if percentage is not None:
+                try:
+                    percentage = Decimal(str(percentage))
+                except ArithmeticError:
+                    percentage = None
+            normalized.append({'user_id': user_id, 'amount': amount, 'percentage': percentage})
+        parsed['participants'] = normalized
+
+        if split_type == 'exact':
+            total = sum((item['amount'] or Decimal('0')) for item in normalized)
+            if total != parsed['total_amount']:
+                errors.append(('amount_mismatch', 'medium', 'Amount mismatch', 'Exact participant amounts do not match total.', True))
+        elif split_type == 'percentage':
+            percent_total = sum((item['percentage'] or Decimal('0')) for item in normalized)
+            if percent_total != Decimal('100'):
+                errors.append(('invalid_split', 'medium', 'Percentage mismatch', 'Participant percentages do not sum to 100.', True))
+
+        if not parsed['category']:
+            errors.append(('missing_category', 'low', 'Missing category', 'Category is recommended for expense classification.', False))
+
+        parsed['source_reference'] = row.get('source_reference', '')
+        return parsed, errors
+
+    @classmethod
+    def create_import_batch(cls, group, imported_by, source_file_name, raw_content):
+        raw_csv_sha256 = cls.checksum_content(raw_content)
+        batch = ImportService.create_batch(group, imported_by, source_file_name, raw_csv_sha256)
+        rows = cls.parse_csv_rows(raw_content)
+        issues_count = 0
+        valid_rows = 0
+
+        for row in rows:
+            import_row = ImportService.add_row(batch, row['row_number'], row['raw_data'])
+            parsed_data, issues = cls.parse_row_data(row['raw_data'], group)
+            import_row.parsed_data = parsed_data
+            import_row.status = 'valid' if not issues else 'anomaly'
+            import_row.save()
+            if not issues:
+                valid_rows += 1
+            else:
+                issues_count += len(issues)
+                for rule_code, severity, description, recommendation, approval in issues:
+                    ImportService.report_issue(
+                        batch,
+                        import_row,
+                        rule_code,
+                        severity,
+                        description,
+                        recommendation,
+                        approval,
+                    )
+        batch.total_rows = len(rows)
+        batch.valid_rows = valid_rows
+        batch.issue_count = issues_count
+        batch.status = 'needs_review' if issues_count else 'completed'
+        batch.completed_at = timezone.now()
+        batch.save()
+        return batch
+
+    @staticmethod
+    def commit_batch(batch, approve_all: bool = False):
+        unresolved = batch.issues.filter(resolved=False, requires_approval=True).exists()
+        if unresolved and not approve_all:
+            raise ValueError('Batch has unresolved approval-required issues.')
+
+        for row in batch.rows.filter(status='valid'):
+            parsed = row.parsed_data
+            if not parsed:
+                continue
+            expense = Expense.objects.create(
+                group=batch.group,
+                payer_id=parsed['payer_id'],
+                description=parsed['description'],
+                category=parsed['category'],
+                total_amount=parsed['total_amount'],
+                currency=parsed['currency'],
+                date=parsed['date'],
+                split_type=parsed['split_type'],
+                source_reference=parsed['source_reference'],
+                created_by=batch.imported_by,
+            )
+            for part in parsed['participants']:
+                ExpenseParticipant.objects.create(
+                    expense=expense,
+                    user_id=part['user_id'],
+                    amount=part['amount'] or Decimal('0'),
+                    percentage=part['percentage'],
+                )
+        batch.status = 'completed'
+        batch.completed_at = timezone.now()
+        batch.save()
+        return batch
