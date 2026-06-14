@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from .models import Expense, ExpenseParticipant, Group, GroupMember, Settlement
-from .services import BalanceService
+from .services import BalanceService, CSVImportService
 
 User = get_user_model()
 
@@ -82,3 +82,46 @@ class BalanceServiceTest(TestCase):
         self.assertEqual(len(settlements), 2)
         self.assertEqual(settlements[0]['amount'], Decimal('100.00'))
         self.assertEqual(settlements[1]['amount'], Decimal('200.00'))
+
+
+class CSVImportServiceTest(TestCase):
+    def setUp(self):
+        self.user_a = User.objects.create_user(email='aisha@example.com', username='aisha', password='testpass')
+        self.user_b = User.objects.create_user(email='rohan@example.com', username='rohan', password='testpass')
+        self.group = Group.objects.create(name='Trip', currency='INR', created_by=self.user_a)
+        GroupMember.objects.create(group=self.group, user=self.user_a, join_date='2026-01-01')
+        GroupMember.objects.create(group=self.group, user=self.user_b, join_date='2026-01-01')
+
+    def test_create_import_batch_with_valid_csv(self):
+        csv_content = (
+            'payer,date,total_amount,currency,split_type,participants,description,category,source_reference\n'
+            'aisha,2026-06-14,1000.00,INR,equal,aisha:500;rohan:500,Dinner,Food,import-1\n'
+        ).encode('utf-8')
+        batch = CSVImportService.create_import_batch(
+            group=self.group,
+            imported_by=self.user_a,
+            source_file_name='expenses.csv',
+            raw_content=csv_content,
+        )
+
+        self.assertEqual(batch.total_rows, 1)
+        self.assertEqual(batch.valid_rows, 1)
+        self.assertEqual(batch.issue_count, 0)
+        self.assertEqual(batch.status, 'completed')
+
+    def test_create_import_batch_with_invalid_member(self):
+        csv_content = (
+            'payer,date,total_amount,currency,split_type,participants,description,category,source_reference\n'
+            'aisha,2026-06-14,1000.00,INR,equal,unknown:500;rohan:500,Dinner,Food,import-2\n'
+        ).encode('utf-8')
+        batch = CSVImportService.create_import_batch(
+            group=self.group,
+            imported_by=self.user_a,
+            source_file_name='errors.csv',
+            raw_content=csv_content,
+        )
+
+        self.assertEqual(batch.total_rows, 1)
+        self.assertEqual(batch.valid_rows, 0)
+        self.assertGreater(batch.issue_count, 0)
+        self.assertEqual(batch.status, 'needs_review')

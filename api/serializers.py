@@ -4,6 +4,7 @@ from typing import Any
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.db.models import Q
 from rest_framework import serializers
 
 from .models import (

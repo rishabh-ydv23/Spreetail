@@ -268,6 +268,12 @@ class CSVImportService:
                 continue
             amount = participant.get('amount')
             percentage = participant.get('percentage')
+            fallback_value = participant.get('value')
+            if fallback_value is not None:
+                if split_type == 'percentage':
+                    percentage = fallback_value
+                else:
+                    amount = fallback_value
             if amount is not None:
                 try:
                     amount = Decimal(str(amount))
