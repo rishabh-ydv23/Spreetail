@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable
 
 from django.db import transaction
-from django.db.models import F, Q, Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from .models import (
@@ -20,6 +20,8 @@ from .models import (
 
 
 class ExpenseService:
+    SCALE = Decimal('0.01')
+
     @staticmethod
     def validate_participants(group_id, date, participants):
         user_ids = [participant['user'].id for participant in participants]
@@ -32,22 +34,32 @@ class ExpenseService:
             raise ValueError('All participants must be active group members for the expense date.')
 
     @staticmethod
-    def apply_split(expense: Expense, participants_data):
+    def quantize_amount(value: Decimal) -> Decimal:
+        return value.quantize(ExpenseService.SCALE, rounding=ROUND_HALF_UP)
+
+    @classmethod
+    def apply_split(cls, expense: Expense, participants_data):
         split_type = expense.split_type
         total_amount = expense.total_amount
         participants = []
 
         if split_type == 'equal':
             count = len(participants_data)
-            share = (total_amount / count).quantize(total_amount.quantize())
-            for data in participants_data:
-                participants.append({**data, 'amount': share})
+            share = cls.quantize_amount(total_amount / Decimal(count))
+            remainder = total_amount - share * count
+            for index, data in enumerate(participants_data):
+                amount = share + (cls.quantize_amount(remainder) if index == 0 else Decimal('0.00'))
+                participants.append({**data, 'amount': amount})
         elif split_type == 'exact':
             participants = participants_data
         elif split_type == 'percentage':
-            for data in participants_data:
-                amount = (total_amount * data['percentage'] / Decimal('100')).quantize(total_amount.quantize())
+            total_allocated = Decimal('0.00')
+            for index, data in enumerate(participants_data):
+                amount = cls.quantize_amount(total_amount * data['percentage'] / Decimal('100'))
+                if index == len(participants_data) - 1:
+                    amount = total_amount - total_allocated
                 participants.append({**data, 'amount': amount})
+                total_allocated += amount
         return participants
 
 

@@ -1,12 +1,14 @@
 from rest_framework import mixins, viewsets
+from rest_framework.authtoken.models import Token
 from rest_framework.authtoken.views import ObtainAuthToken
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Group, GroupMember, ImportBatch, ImportIssue, ImportRow, Settlement
+from .models import Expense, Group, GroupMember, ImportBatch, ImportIssue, ImportRow, Settlement
 from .permissions import IsGroupMember
+from .services import BalanceService
 from .serializers import (
     ExpenseSerializer,
     GroupMemberSerializer,
@@ -21,14 +23,11 @@ from .serializers import (
 
 class LoginView(ObtainAuthToken):
     def post(self, request, *args, **kwargs):
-        response = super().post(request, *args, **kwargs)
-        token = response.data['token']
-        user = self.user
-        payload = {
-            'token': token,
-            'user': UserSerializer(user).data,
-        }
-        return Response(payload)
+        serializer = self.serializer_class(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        user = serializer.validated_data['user']
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response({'token': token.key, 'user': UserSerializer(user).data})
 
 
 class CurrentUserView(APIView):
@@ -49,6 +48,31 @@ class GroupViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    @action(detail=True, methods=['get'])
+    def balances(self, request, pk=None):
+        balances = BalanceService.compute_member_balances(pk)
+        return Response({
+            'group_id': pk,
+            'currency': self.get_object().currency,
+            'net_balances': [{
+                'user_id': str(user_id),
+                'net_balance': str(amount),
+            } for user_id, amount in balances.items()],
+        })
+
+    @action(detail=True, methods=['get'], url_path='balances/simplified-settlements')
+    def simplified_settlements(self, request, pk=None):
+        balances = BalanceService.compute_member_balances(pk)
+        suggested = BalanceService.simplified_settlements(balances)
+        return Response({
+            'group_id': pk,
+            'currency': self.get_object().currency,
+            'suggested_settlements': [
+                {'from_user_id': str(item['from_user_id']), 'to_user_id': str(item['to_user_id']), 'amount': str(item['amount'])}
+                for item in suggested
+            ],
+        })
 
 
 class GroupMemberViewSet(viewsets.ModelViewSet):

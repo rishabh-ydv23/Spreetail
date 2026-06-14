@@ -49,9 +49,22 @@ class GroupMemberSerializer(serializers.ModelSerializer):
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         join_date = attrs.get('join_date', getattr(self.instance, 'join_date', None))
         leave_date = attrs.get('leave_date', getattr(self.instance, 'leave_date', None))
+        user = attrs.get('user', getattr(self.instance, 'user', None))
+        group_id = self.context.get('view').kwargs.get('group_pk') if self.context.get('view') else None
 
         if leave_date is not None and leave_date < join_date:
             raise serializers.ValidationError('leave_date must be the same as or later than join_date.')
+
+        if group_id and user:
+            overlap = GroupMember.objects.filter(
+                group_id=group_id,
+                user=user,
+            ).exclude(pk=getattr(self.instance, 'pk', None)).filter(
+                join_date__lte=leave_date or join_date,
+                leave_date__gte=join_date,
+            )
+            if overlap.exists():
+                raise serializers.ValidationError('The member has overlapping membership periods within the group.')
 
         return attrs
 
@@ -127,6 +140,17 @@ class ExpenseSerializer(serializers.ModelSerializer):
             total_percent = sum(item['percentage'] for item in participants if item.get('percentage') is not None)
             if total_percent != Decimal('100'):
                 raise serializers.ValidationError('Percentage split values must sum to 100.')
+
+        group_id = self.context.get('view').kwargs.get('group_pk') if self.context.get('view') else None
+        if group_id and participants and attrs.get('date'):
+            user_ids = [participant['user'].id for participant in participants]
+            active_members = GroupMember.objects.filter(
+                group_id=group_id,
+                user_id__in=user_ids,
+                join_date__lte=attrs['date'],
+            ).filter(Q(leave_date__gte=attrs['date']) | Q(leave_date__isnull=True))
+            if active_members.count() != len(user_ids):
+                raise serializers.ValidationError('All participants must be active members on the expense date.')
         return attrs
 
     def create(self, validated_data: dict[str, Any]) -> Expense:
