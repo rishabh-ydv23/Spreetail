@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.utils import timezone
 
 from .models import Expense, Group, GroupMember, ImportBatch, ImportIssue, ImportRow, Settlement
 from .permissions import IsGroupMember
@@ -175,6 +176,7 @@ class ImportBatchViewSet(viewsets.ModelViewSet):
 
 
 class ImportIssueViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, IsGroupMember]
     queryset = ImportIssue.objects.all()
     serializer_class = ImportIssueSerializer
 
@@ -182,8 +184,17 @@ class ImportIssueViewSet(viewsets.ModelViewSet):
         batch_id = self.kwargs['importbatch_pk']
         return self.queryset.filter(import_batch_id=batch_id)
 
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, group_pk=None, importbatch_pk=None, pk=None):
+        issue = self.get_object()
+        issue.resolved = True
+        issue.resolved_at = timezone.now()
+        issue.save(update_fields=['resolved', 'resolved_at'])
+        return Response(self.get_serializer(issue).data)
+
 
 class ImportRowViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated, IsGroupMember]
     queryset = ImportRow.objects.all()
     serializer_class = ImportRowSerializer
 

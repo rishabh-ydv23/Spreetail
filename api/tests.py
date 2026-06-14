@@ -1,6 +1,8 @@
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
 
 from .models import Expense, ExpenseParticipant, Group, GroupMember, Settlement
 from .services import BalanceService, CSVImportService
@@ -91,6 +93,8 @@ class CSVImportServiceTest(TestCase):
         self.group = Group.objects.create(name='Trip', currency='INR', created_by=self.user_a)
         GroupMember.objects.create(group=self.group, user=self.user_a, join_date='2026-01-01')
         GroupMember.objects.create(group=self.group, user=self.user_b, join_date='2026-01-01')
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user_a)
 
     def test_create_import_batch_with_valid_csv(self):
         csv_content = (
@@ -125,3 +129,33 @@ class CSVImportServiceTest(TestCase):
         self.assertEqual(batch.valid_rows, 0)
         self.assertGreater(batch.issue_count, 0)
         self.assertEqual(batch.status, 'needs_review')
+
+    def test_issue_resolve_and_commit_requires_approval(self):
+        csv_content = (
+            'payer,date,total_amount,currency,split_type,participants,description,category,source_reference\n'
+            'aisha,2026-06-14,1000.00,INR,equal,unknown:500;rohan:500,Dinner,Food,import-3\n'
+        ).encode('utf-8')
+        batch = CSVImportService.create_import_batch(
+            group=self.group,
+            imported_by=self.user_a,
+            source_file_name='errors.csv',
+            raw_content=csv_content,
+        )
+        self.assertEqual(batch.status, 'needs_review')
+        self.assertGreater(batch.issue_count, 0)
+
+        batch_url = reverse('group-import-detail', args=[self.group.id, batch.id])
+        response = self.client.post(f'{batch_url}commit/', {'approve_all': False}, format='json')
+        self.assertEqual(response.status_code, 409)
+
+        issue = batch.issues.first()
+        self.assertIsNotNone(issue)
+        issue_url = reverse('group-import-issue-detail', args=[self.group.id, batch.id, issue.id])
+        response = self.client.post(f'{issue_url}resolve/')
+        self.assertEqual(response.status_code, 200)
+
+        batch.refresh_from_db()
+        response = self.client.post(f'{batch_url}commit/', {'approve_all': False}, format='json')
+        self.assertEqual(response.status_code, 200)
+        batch.refresh_from_db()
+        self.assertEqual(batch.status, 'completed')

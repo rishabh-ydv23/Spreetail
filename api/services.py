@@ -220,11 +220,12 @@ class CSVImportService:
         payer_identifier = row.get('payer')
         if not payer_identifier:
             errors.append(('missing_payer', 'high', 'Missing payer', 'Provide a payer value.', True))
+            parsed['payer_id'] = None
         else:
             payer_id = cls.resolve_user_id(group, payer_identifier)
             if not payer_id:
                 errors.append(('unknown_member', 'high', 'Unknown payer', f'Could not resolve payer {payer_identifier}.', True))
-            parsed['payer_id'] = payer_id
+            parsed['payer_id'] = str(payer_id) if payer_id else None
 
         if not row.get('description'):
             row['description'] = 'Imported expense'
@@ -233,7 +234,8 @@ class CSVImportService:
 
         date_value = row.get('date')
         try:
-            parsed['date'] = timezone.datetime.fromisoformat(date_value).date() if date_value else None
+            parsed_date = timezone.datetime.fromisoformat(date_value).date() if date_value else None
+            parsed['date'] = parsed_date.isoformat() if parsed_date else None
         except (TypeError, ValueError):
             errors.append(('invalid_date', 'high', 'Invalid date', f'Expense date is invalid: {date_value}', True))
             parsed['date'] = None
@@ -284,7 +286,7 @@ class CSVImportService:
                     percentage = Decimal(str(percentage))
                 except ArithmeticError:
                     percentage = None
-            normalized.append({'user_id': user_id, 'amount': amount, 'percentage': percentage})
+            normalized.append({'user_id': str(user_id), 'amount': amount, 'percentage': percentage})
         parsed['participants'] = normalized
 
         if split_type == 'exact':
@@ -300,6 +302,21 @@ class CSVImportService:
             errors.append(('missing_category', 'low', 'Missing category', 'Category is recommended for expense classification.', False))
 
         parsed['source_reference'] = row.get('source_reference', '')
+
+        # Convert non-JSON-serializable types to primitives for storage
+        if parsed.get('total_amount') is not None and isinstance(parsed['total_amount'], Decimal):
+            parsed['total_amount'] = str(parsed['total_amount'])
+
+        conv_parts = []
+        for p in parsed.get('participants', []):
+            cp = p.copy()
+            if cp.get('amount') is not None and isinstance(cp['amount'], Decimal):
+                cp['amount'] = str(cp['amount'])
+            if cp.get('percentage') is not None and isinstance(cp['percentage'], Decimal):
+                cp['percentage'] = str(cp['percentage'])
+            conv_parts.append(cp)
+        parsed['participants'] = conv_parts
+
         return parsed, errors
 
     @classmethod
@@ -348,24 +365,30 @@ class CSVImportService:
             parsed = row.parsed_data
             if not parsed:
                 continue
+            # Convert stored primitives back to model types
+            total_amount = Decimal(parsed['total_amount']) if parsed.get('total_amount') is not None else Decimal('0')
+            date_val = timezone.datetime.fromisoformat(parsed['date']).date() if parsed.get('date') else None
+
             expense = Expense.objects.create(
                 group=batch.group,
                 payer_id=parsed['payer_id'],
                 description=parsed['description'],
                 category=parsed['category'],
-                total_amount=parsed['total_amount'],
+                total_amount=total_amount,
                 currency=parsed['currency'],
-                date=parsed['date'],
+                date=date_val,
                 split_type=parsed['split_type'],
                 source_reference=parsed['source_reference'],
                 created_by=batch.imported_by,
             )
-            for part in parsed['participants']:
+            for part in parsed.get('participants', []):
+                amt = Decimal(part['amount']) if part.get('amount') else Decimal('0')
+                pct = Decimal(part['percentage']) if part.get('percentage') else None
                 ExpenseParticipant.objects.create(
                     expense=expense,
                     user_id=part['user_id'],
-                    amount=part['amount'] or Decimal('0'),
-                    percentage=part['percentage'],
+                    amount=amt,
+                    percentage=pct,
                 )
         batch.status = 'completed'
         batch.completed_at = timezone.now()
