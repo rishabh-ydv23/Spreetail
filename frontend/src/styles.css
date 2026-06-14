@@ -1,0 +1,7 @@
+body{font-family: Arial, sans-serif;padding:20px}
+nav{margin-bottom:10px}
+.app{max-width:900px;margin:0 auto}
+.login input{display:block;margin:6px 0;padding:6px}
+.batch{background:#f7f7f7;padding:10px;margin-top:10px}
+.error{color:#900}
+button{margin-left:8px}
